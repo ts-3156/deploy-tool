@@ -5,10 +5,10 @@ require 'aws-sdk-elasticloadbalancingv2'
 # Running in parallel makes it impossible to rescue Interrupt
 SSHKit.config.default_runner = :sequence
 
-class SSHUtil
-  def self.append_to_config(id, host, ip)
+class SSHConfig
+  def self.append(id, host, ip)
     text = <<~"TEXT"
-      # #{Date.today} #{id}
+      # #{Time.now} #{id}
       Host #{host}
         HostName     #{ip}
         IdentityFile #{ENV['SSH_KEY']}
@@ -19,7 +19,7 @@ class SSHUtil
   end
 end
 
-class NameUtil
+class ServerName
   LIST = %w(Brilliant Cheerful Courageous Delightful Energetic Friendly Graceful Optimistic Radiant Vibrant)
 
   def self.gen(prefix)
@@ -27,20 +27,27 @@ class NameUtil
   end
 end
 
-class AZUtil
-  def self.az_to_subnet(az)
-    case az[-1]
-    when 'b' then ENV['AWS_SUBNET_B']
-    when 'c' then ENV['AWS_SUBNET_C']
-    else raise("Invalid AZ name=#{az}")
+class LockFile
+  def self.with_lock(file = 'deploy.pid', &block)
+    started = false
+
+    if File.exist?(file)
+      raise 'Another deploy task is already running'
     end
+
+    File.write(file, Process.pid)
+    started = true
+
+    yield
+  ensure
+    File.delete(file) if started && File.exist?(file)
   end
 end
 
 class EC2Client
   def initialize
     @ec2 = Aws::EC2::Resource.new(region: ENV['AWS_REGION'])
-    @logger = Logger.new(STDOUT, datetime_format = '%Y-%m-%dT%H:%M:%S', formatter: proc { |s, t, p, m|
+    @logger = Logger.new(STDOUT, datetime_format: '%Y-%m-%dT%H:%M:%S', formatter: proc { |s, t, p, m|
       "[#{t}] #{s} -- #{m}\n"
     })
   end
@@ -123,7 +130,7 @@ class TargetGroupClient
   def initialize(arn)
     @arn = arn
     @elb = Aws::ElasticLoadBalancingV2::Client.new(region: ENV['AWS_REGION'])
-    @logger = Logger.new(STDOUT, datetime_format = '%Y-%m-%dT%H:%M:%S', formatter: proc { |s, t, p, m|
+    @logger = Logger.new(STDOUT, datetime_format: '%Y-%m-%dT%H:%M:%S', formatter: proc { |s, t, p, m|
       "[#{t}] #{s} -- #{m}\n"
     })
   end
@@ -171,13 +178,21 @@ class TargetGroupClient
     end.sort_by(&:launch_time)[0]
   end
 
-  def pick_availability_zone
+  def pick_subnet
     count = availability_zones.map { |name| [name, 0] }.to_h
     registered_instances.each { |i| count[i.placement.availability_zone] += 1 }
-    count.sort_by { |_, v| v }[0][0]
+    az_to_subnet(count.sort_by { |_, v| v }[0][0])
   end
 
   private
+
+  def az_to_subnet(az)
+    case az[-1]
+    when 'b' then ENV['AWS_SUBNET_B']
+    when 'c' then ENV['AWS_SUBNET_C']
+    else raise("Invalid AZ name=#{az}")
+    end
+  end
 
   def availability_zones
     arn = @elb.describe_target_groups(target_group_arns: [@arn]).target_groups[0].load_balancer_arns[0]
@@ -203,19 +218,17 @@ namespace :ec2 do
   end
 
   task :launch do
-    # TODO Create a lock file
-
     ec2 = EC2Client.new
     tg = TargetGroupClient.new(ENV['AWS_TARGET_GROUP'])
-    name = NameUtil.gen(ENV['APP_NAME'])
+    name = ServerName.gen(ENV['APP_NAME'])
     instance = ec2.launch(name, {
-        'subnet-id' => AZUtil.az_to_subnet(tg.pick_availability_zone),
+        'subnet-id' => tg.pick_subnet,
         'security-group' => ENV['AWS_SECURITY_GROUP'],
         'launch-template-id' => ENV['AWS_LAUNCH_TEMPLATE'],
         'instance-type' => ENV['AWS_INSTANCE_TYPE']
     })
     on :local do
-      execute("tail -n 5 #{SSHUtil.append_to_config(instance.id, name, instance.public_ip_address)}")
+      execute("tail -n 5 #{SSHConfig.append(instance.id, name, instance.public_ip_address)}")
     end
 
     set(:instance_name, name)
@@ -261,13 +274,15 @@ end
 Rake::Task['deploy'].clear_actions
 
 task :deploy do
-  invoke 'ec2:launch'
-  invoke 'ec2:install'
-  invoke 'ec2:register'
-  invoke 'ec2:deregister'
-  instance = EC2Client.new.retrieve(fetch(:deregistered_id))
-  set(:instance_id, instance.id)
-  set(:instance_name, instance.tags.find { |t| t.key == 'Name' }.value)
-  invoke 'ec2:uninstall'
-  invoke 'ec2:terminate'
+  LockFile.with_lock do
+    invoke 'ec2:launch'
+    invoke 'ec2:install'
+    invoke 'ec2:register'
+    invoke 'ec2:deregister'
+    instance = EC2Client.new.retrieve(fetch(:deregistered_id))
+    set(:instance_id, instance.id)
+    set(:instance_name, instance.tags.find { |t| t.key == 'Name' }.value)
+    invoke 'ec2:uninstall'
+    invoke 'ec2:terminate'
+  end
 end
