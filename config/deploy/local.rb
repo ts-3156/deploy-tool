@@ -2,6 +2,9 @@ require 'dotenv/load'
 require 'aws-sdk-ec2'
 require 'aws-sdk-elasticloadbalancingv2'
 
+# Running in parallel makes it impossible to rescue Interrupt
+SSHKit.config.default_runner = :sequence
+
 class SSHUtil
   def self.append_to_config(id, host, ip)
     text = <<~"TEXT"
@@ -12,7 +15,15 @@ class SSHUtil
         User         #{ENV['SSH_USER']}
     TEXT
     File.open(ENV['SSH_CONFIG'], 'a') { |f| f.puts(text) }
-    text
+    ENV['SSH_CONFIG']
+  end
+end
+
+class NameUtil
+  LIST = %w(Brilliant Cheerful Courageous Delightful Energetic Friendly Graceful Optimistic Radiant Vibrant)
+
+  def self.gen(prefix)
+    "#{prefix}-#{Time.now.strftime('%m%d%H%M')}-#{LIST.sample}"
   end
 end
 
@@ -29,7 +40,9 @@ end
 class EC2Client
   def initialize
     @ec2 = Aws::EC2::Resource.new(region: ENV['AWS_REGION'])
-    @logger = Logger.new(STDOUT)
+    @logger = Logger.new(STDOUT, datetime_format = '%Y-%m-%dT%H:%M:%S', formatter: proc { |s, t, p, m|
+      "[#{t}] #{s} -- #{m}\n"
+    })
   end
 
   def launch(name, values)
@@ -49,11 +62,15 @@ class EC2Client
     wait_until(id, :instance_status_ok)
     instance = retrieve(id)
     wait_until_ssh_connection_ok(id, instance.public_ip_address)
-
     instance.create_tags(tags: [{key: 'Name', value: name}])
-    SSHUtil.append_to_config(id, name, instance.public_ip_address)
 
     instance
+  rescue Interrupt, StandardError => e
+    if id
+      @logger.error "\x1b[31mTerminate #{id} because #{e.class} is raised\x1b[0m"
+      terminate(id)
+    end
+    raise
   end
 
   def terminate(id)
@@ -84,7 +101,7 @@ class EC2Client
     cmd = "ssh -q -i #{ENV['SSH_KEY']} -o StrictHostKeyChecking=no #{ENV['SSH_USER']}@#{ip} exit"
 
     max_retries.times do |n|
-      @logger.info "waiting for ssh_connection_ok #{id} (#{ip})"
+      @logger.info "waiting for ssh_connection_ok #{id}"
       system(cmd, exception: false) ? break : sleep(interval)
       raise 'ssh connection not established' if n == max_retries - 1
     end
@@ -106,7 +123,9 @@ class TargetGroupClient
   def initialize(arn)
     @arn = arn
     @elb = Aws::ElasticLoadBalancingV2::Client.new(region: ENV['AWS_REGION'])
-    @logger = Logger.new(STDOUT)
+    @logger = Logger.new(STDOUT, datetime_format = '%Y-%m-%dT%H:%M:%S', formatter: proc { |s, t, p, m|
+      "[#{t}] #{s} -- #{m}\n"
+    })
   end
 
   def register(instance_id)
@@ -179,49 +198,76 @@ class TargetGroupClient
 end
 
 namespace :ec2 do
+  %i(launch terminate register deregister).each do |name|
+    task(name) { on(:local) { execute('echo "Started" >/dev/null') } }
+  end
+
   task :launch do
+    # TODO Create a lock file
+
     ec2 = EC2Client.new
     tg = TargetGroupClient.new(ENV['AWS_TARGET_GROUP'])
-    name = "#{ENV['APP_NAME']}-#{Time.now.strftime('%m%d%H%M')}"
-    instance = nil
-
+    name = NameUtil.gen(ENV['APP_NAME'])
+    instance = ec2.launch(name, {
+        'subnet-id' => AZUtil.az_to_subnet(tg.pick_availability_zone),
+        'security-group' => ENV['AWS_SECURITY_GROUP'],
+        'launch-template-id' => ENV['AWS_LAUNCH_TEMPLATE'],
+        'instance-type' => ENV['AWS_INSTANCE_TYPE']
+    })
     on :local do
-      values = {
-          'subnet-id' => AZUtil.az_to_subnet(tg.pick_availability_zone),
-          'security-group' => ENV['AWS_SECURITY_GROUP'],
-          'launch-template-id' => ENV['AWS_LAUNCH_TEMPLATE'],
-          'instance-type' => ENV['AWS_INSTANCE_TYPE'],
-      }
-      instance = ec2.launch(name, values)
+      execute("tail -n 5 #{SSHUtil.append_to_config(instance.id, name, instance.public_ip_address)}")
     end
 
-    on name do
-      puts execute('sudo yum install -y httpd')
-      puts execute(%q(sudo sh -c "echo 'hello' >/var/www/html/index.html"))
-      puts execute('sudo service httpd start')
-    end
+    set(:instance_name, name)
+    set(:instance_id, instance.id)
+  end
 
-    on :local do
-      tg.register(instance.id)
+  task :terminate do
+    EC2Client.new.terminate(fetch(:instance_id) || ENV['INSTANCE_ID'])
+  end
+
+  task :install do
+    on fetch(:instance_name) do
+      execute('sudo yum install -y -q httpd')
+      execute(%q(sudo sh -c "echo 'hello' >/var/www/html/index.html"))
+      execute('sudo service httpd start')
+    end
+  end
+
+  task :uninstall do
+    on fetch(:instance_name) do
+      execute('sudo service httpd stop')
     end
   end
 
   task :register do
-    on :local do
-      client = TargetGroupClient.new(ENV['AWS_TARGET_GROUP'])
-      client.register(ENV['INSTANCE_ID'])
-    end
+    client = TargetGroupClient.new(ENV['AWS_TARGET_GROUP'])
+    client.register(fetch(:instance_id) || ENV['INSTANCE_ID'])
   end
 
   task :deregister do
-    on :local do
-      client = TargetGroupClient.new(ENV['AWS_TARGET_GROUP'])
-      instance_id = ENV['INSTANCE_ID'] || client.deregistrable_instance.id
-      client.deregister(instance_id)
-
-      if ENV['TERMINATE']
-        EC2Client.new.terminate(instance_id)
-      end
-    end
+    client = TargetGroupClient.new(ENV['AWS_TARGET_GROUP'])
+    instance_id = ENV['INSTANCE_ID'] || client.deregistrable_instance.id
+    client.deregister(instance_id)
+    set(:deregistered_id, instance_id)
   end
+
+  %i(launch terminate register deregister).each do |name|
+    task(name) { on(:local) { execute('echo "Finished" >/dev/null') } }
+  end
+end
+
+# Clear predefined 'deploy' task
+Rake::Task['deploy'].clear_actions
+
+task :deploy do
+  invoke 'ec2:launch'
+  invoke 'ec2:install'
+  invoke 'ec2:register'
+  invoke 'ec2:deregister'
+  instance = EC2Client.new.retrieve(fetch(:deregistered_id))
+  set(:instance_id, instance.id)
+  set(:instance_name, instance.tags.find { |t| t.key == 'Name' }.value)
+  invoke 'ec2:uninstall'
+  invoke 'ec2:terminate'
 end
