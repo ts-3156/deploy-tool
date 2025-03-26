@@ -2,6 +2,7 @@
 
 source "https://rubygems.org"
 
+gem "dotenv"
 gem "fiddle"
 gem "capistrano"
 gem "rexml"

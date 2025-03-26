@@ -1,2 +1,5 @@
 /.bundle
-
+/.idea
+/log
+/ssh_config
+/.env
