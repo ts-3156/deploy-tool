@@ -44,11 +44,33 @@ class LockFile
   end
 end
 
+class InstanceWrapper
+  def initialize(instance)
+    @instance = instance
+  end
+
+  def method_missing(...)
+    @instance.send(...)
+  end
+
+  def instance_name
+    @instance.tags.find { |t| t.key == 'Name' }.value
+  end
+
+  def dns_name
+    @instance.public_dns_name
+  end
+
+  def terminatable?
+    !@instance.describe_attribute(attribute: 'disableApiTermination').disable_api_termination.value
+  end
+end
+
 class EC2Client
   def initialize
     @ec2 = Aws::EC2::Resource.new(region: ENV['AWS_REGION'])
-    @logger = Logger.new(STDOUT, datetime_format: '%Y-%m-%dT%H:%M:%S', formatter: proc { |s, t, p, m|
-      "[#{t}] #{s} -- #{m}\n"
+    @logger = Logger.new(STDOUT, formatter: proc { |s, t, p, m|
+      "[#{t.strftime('%Y-%m-%dT%H:%M:%S')}] #{s} -- #{m}\n"
     })
   end
 
@@ -89,6 +111,11 @@ class EC2Client
     @ec2.instances(filters: filters).first
   end
 
+  def retrieve_by(name:)
+    filters = [{name: 'tag:Name', values: [name]}, {name: 'instance-state-name', values: ['running']}]
+    @ec2.instances(filters: filters).first
+  end
+
   private
 
   def pick_launch_template(values)
@@ -120,7 +147,7 @@ class EC2Client
         @logger.info "waiting for #{state} #{id}"
       end
     end
-  rescue ::Aws::Waiters::Errors::WaiterFailed => e
+  rescue Aws::Waiters::Errors::WaiterFailed => e
     raise "Failed message=#{e.message}"
   end
 
@@ -130,8 +157,8 @@ class TargetGroupClient
   def initialize(arn)
     @arn = arn
     @elb = Aws::ElasticLoadBalancingV2::Client.new(region: ENV['AWS_REGION'])
-    @logger = Logger.new(STDOUT, datetime_format: '%Y-%m-%dT%H:%M:%S', formatter: proc { |s, t, p, m|
-      "[#{t}] #{s} -- #{m}\n"
+    @logger = Logger.new(STDOUT, formatter: proc { |s, t, p, m|
+      "[#{t.strftime('%Y-%m-%dT%H:%M:%S')}] #{s} -- #{m}\n"
     })
   end
 
@@ -174,7 +201,7 @@ class TargetGroupClient
 
   def deregistrable_instance
     registered_instances.select do |instance|
-      !instance.describe_attribute(attribute: 'disableApiTermination').disable_api_termination.value
+      InstanceWrapper.new(instance).terminatable?
     end.sort_by(&:launch_time)[0]
   end
 
@@ -207,7 +234,7 @@ class TargetGroupClient
         @logger.info "waiting for #{state} #{instance_id}"
       end
     end
-  rescue ::Aws::Waiters::Errors::WaiterFailed => e
+  rescue Aws::Waiters::Errors::WaiterFailed => e
     raise "Failed message=#{e.message}"
   end
 end
@@ -240,10 +267,16 @@ namespace :ec2 do
   end
 
   task :install do
+    instance = InstanceWrapper.new(EC2Client.new.retrieve(fetch(:instance_id)))
     on fetch(:instance_name) do
       execute('sudo yum install -y -q httpd')
       execute(%q(sudo sh -c "echo 'hello' >/var/www/html/index.html"))
       execute('sudo service httpd start')
+      execute('sudo service httpd start')
+      execute("sudo sed -i -e 's/_HOSTNAME_/#{instance.instance_name}/g' ~/.bashrc")
+    end
+    on :local do
+      execute("curl -sS #{instance.dns_name}")
     end
   end
 
@@ -265,6 +298,11 @@ namespace :ec2 do
     set(:deregistered_id, instance_id)
   end
 
+  task :list do
+    client = TargetGroupClient.new(ENV['AWS_TARGET_GROUP'])
+    puts client.registered_instances.map { |i| InstanceWrapper.new(i).instance_name }.sort.join(',')
+  end
+
   %i(launch terminate register deregister).each do |name|
     task(name) { on(:local) { execute('echo "Finished" >/dev/null') } }
   end
@@ -279,10 +317,13 @@ task :deploy do
     invoke 'ec2:install'
     invoke 'ec2:register'
     invoke 'ec2:deregister'
-    instance = EC2Client.new.retrieve(fetch(:deregistered_id))
+    launched_id = fetch(:instance_id)
+    launched_name = fetch(:instance_name)
+    instance = InstanceWrapper.new(EC2Client.new.retrieve(fetch(:deregistered_id)))
     set(:instance_id, instance.id)
-    set(:instance_name, instance.tags.find { |t| t.key == 'Name' }.value)
+    set(:instance_name, instance.instance_name)
     invoke 'ec2:uninstall'
     invoke 'ec2:terminate'
+    puts "Deploy succeeded: #{launched_name} (#{launched_id})"
   end
 end
