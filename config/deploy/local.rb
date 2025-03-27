@@ -20,10 +20,11 @@ class SSHConfig
 end
 
 class ServerName
-  LIST = %w(Brilliant Cheerful Courageous Delightful Energetic Friendly Graceful Optimistic Radiant Vibrant Awesome Bold Charming Confident Dazzling Enthusiastic Fabulous Gentle Joyful Lively)
+  @list = %w(Brilliant Cheerful Courageous Delightful Energetic Friendly Graceful Optimistic Radiant Vibrant).shuffle
 
   def self.gen(prefix, index)
-    "#{prefix}-#{Time.now.strftime('%m%d%H%M')}-#{index + 1}-#{LIST.sample}"
+    @list.push(elem = @list.shift)
+    "#{prefix}-#{Time.now.strftime('%m%d%H%M')}-#{index + 1}-#{elem}"
   end
 end
 
@@ -216,13 +217,13 @@ class TargetGroupClient
   def deregistrable_instance
     registered_instances.select do |instance|
       InstanceWrapper.new(instance).terminatable?
-    end.sort_by(&:launch_time)[0]
+    end.min_by(&:launch_time)
   end
 
   def pick_subnet
     count = availability_zones.map { |name| [name, 0] }.to_h
     registered_instances.each { |i| count[i.placement.availability_zone] += 1 }
-    az_to_subnet(count.sort_by { |_, v| v }[0][0])
+    az_to_subnet(count.min_by { |_, v| v }[0])
   end
 
   private
