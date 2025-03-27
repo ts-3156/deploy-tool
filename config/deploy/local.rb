@@ -20,10 +20,10 @@ class SSHConfig
 end
 
 class ServerName
-  LIST = %w(Brilliant Cheerful Courageous Delightful Energetic Friendly Graceful Optimistic Radiant Vibrant)
+  LIST = %w(Brilliant Cheerful Courageous Delightful Energetic Friendly Graceful Optimistic Radiant Vibrant Awesome Bold Charming Confident Dazzling Enthusiastic Fabulous Gentle Joyful Lively)
 
-  def self.gen(prefix)
-    "#{prefix}-#{Time.now.strftime('%m%d%H%M')}-#{LIST.sample}"
+  def self.gen(prefix, index)
+    "#{prefix}-#{Time.now.strftime('%m%d%H%M')}-#{index + 1}-#{LIST.sample}"
   end
 end
 
@@ -64,6 +64,12 @@ class InstanceWrapper
   def terminatable?
     !@instance.describe_attribute(attribute: 'disableApiTermination').disable_api_termination.value
   end
+
+  class << self
+    def retrieve(id)
+      new(EC2Client.new.retrieve(id))
+    end
+  end
 end
 
 class EC2Client
@@ -74,36 +80,43 @@ class EC2Client
     })
   end
 
-  def launch(name, values)
+  def launch(options)
     params = {
-        min_count: 1,
-        max_count: 1,
-        launch_template: pick_launch_template(values),
-        instance_market_options: pick_market_type(values),
-        security_group_ids: [values['security-group']],
-        subnet_id: values['subnet-id'],
-        instance_type: values['instance-type'] # Optional
+        min_count: options[:launch_count],
+        max_count: options[:launch_count],
+        launch_template: pick_launch_template(options),
+        instance_market_options: pick_market_type(options),
+        security_group_ids: [options[:security_group]],
+        subnet_id: options[:subnet_id],
+        instance_type: options[:instance_type] # Optional
     }.compact
 
-    instance = @ec2.create_instances(params).first
-    id = instance.id
-    wait_until(id, :instance_running)
-    wait_until(id, :instance_status_ok)
-    instance = retrieve(id)
-    wait_until_ssh_connection_ok(id, instance.public_ip_address)
-    instance.create_tags(tags: [{key: 'Name', value: name}])
+    collection = @ec2.create_instances(params)
+    ids = collection.map(&:id)
+    instances = []
 
-    instance
+    collection.each do |instance|
+      id = instance.id
+      wait_until(id, :instance_running)
+      wait_until(id, :instance_status_ok)
+      instance = retrieve(id)
+      wait_until_ssh_connection_ok(id, instance.public_ip_address)
+      instances << instance
+    end
+
+    instances
   rescue Interrupt, StandardError => e
-    if id
-      @logger.error "\x1b[31mTerminate #{id} because #{e.class} is raised\x1b[0m"
-      terminate(id)
+    if ids
+      @logger.error "\x1b[31mTerminate #{ids.join(',')} because #{e.class} is raised\x1b[0m"
+      terminate(ids)
     end
     raise
   end
 
-  def terminate(id)
-    @ec2.client.terminate_instances({instance_ids: [id]})
+  def terminate(ids)
+    ids = [ids] unless ids.is_a?(Array)
+    @ec2.client.terminate_instances({instance_ids: ids})
+    ids.each { |id| wait_until(id, :instance_terminated) }
   end
 
   def retrieve(id)
@@ -111,6 +124,7 @@ class EC2Client
     @ec2.instances(filters: filters).first
   end
 
+  # Not used
   def retrieve_by(name:)
     filters = [{name: 'tag:Name', values: [name]}, {name: 'instance-state-name', values: ['running']}]
     @ec2.instances(filters: filters).first
@@ -120,13 +134,13 @@ class EC2Client
 
   def pick_launch_template(values)
     {
-        launch_template_id: values['launch-template-id'],
-        version: values['launch-template-version'] # Optional
+        launch_template_id: values[:launch_template_id],
+        version: values[:launch_template_version] # Optional
     }.compact
   end
 
   def pick_market_type(values)
-    if values['market-type'] == 'spot'
+    if values[:market_type] == 'spot'
       {market_type: 'spot'}
     end
   end
@@ -241,61 +255,79 @@ end
 
 namespace :ec2 do
   %i(launch terminate register deregister).each do |name|
-    task(name) { on(:local) { execute('echo "Started" >/dev/null') } }
+    task(name) { on(:local) { info('Started') } }
   end
 
   task :launch do
     ec2 = EC2Client.new
     tg = TargetGroupClient.new(ENV['AWS_TARGET_GROUP'])
-    name = ServerName.gen(ENV['APP_NAME'])
-    instance = ec2.launch(name, {
-        'subnet-id' => tg.pick_subnet,
-        'security-group' => ENV['AWS_SECURITY_GROUP'],
-        'launch-template-id' => ENV['AWS_LAUNCH_TEMPLATE'],
-        'instance-type' => ENV['AWS_INSTANCE_TYPE']
-    })
-    on :local do
-      execute("tail -n 5 #{SSHConfig.append(instance.id, name, instance.public_ip_address)}")
+    launch_count = ENV['LAUNCH_COUNT']&.to_i || 1
+    names = launch_count.times.map { |n| ServerName.gen(ENV['APP_NAME'], n) }
+    instances = ec2.launch(
+        launch_count: launch_count,
+        subnet_id: tg.pick_subnet,
+        security_group: ENV['AWS_SECURITY_GROUP'],
+        launch_template_id: ENV['AWS_LAUNCH_TEMPLATE'],
+        instance_type: ENV['AWS_INSTANCE_TYPE'],
+        market_type: 'spot'
+    )
+
+    instances.each.with_index do |instance, i|
+      instance.create_tags(tags: [{key: 'Name', value: names[i]}])
+      on :local do
+        execute("tail -n 5 #{SSHConfig.append(instance.id, names[i], instance.public_ip_address)}")
+      end
     end
 
-    set(:instance_name, name)
-    set(:instance_id, instance.id)
+    set(:instance_names, names)
+    set(:instance_ids, instances.map(&:id))
   end
 
   task :terminate do
-    EC2Client.new.terminate(fetch(:instance_id) || ENV['INSTANCE_ID'])
+    EC2Client.new.terminate(fetch(:deregistered_ids) || [ENV['INSTANCE_ID']])
   end
 
   task :install do
-    instance = InstanceWrapper.new(EC2Client.new.retrieve(fetch(:instance_id)))
-    on fetch(:instance_name) do
+    on fetch(:instance_names), in: :parallel do |host|
+      execute('sudo rm -rf /var/tmp/aws-mon/*')
+      # execute('sudo cp /dev/null /var/log/httpd/access_log')
+      # execute('sudo cp /dev/null /var/log/httpd/error_log')
       execute('sudo yum install -y -q httpd')
       execute(%q(sudo sh -c "echo 'hello' >/var/www/html/index.html"))
       execute('sudo service httpd start')
-      execute('sudo service httpd start')
-      execute("sudo sed -i -e 's/_HOSTNAME_/#{instance.instance_name}/g' ~/.bashrc")
-    end
-    on :local do
-      execute("curl -sS #{instance.dns_name}")
+      execute('curl -sS localhost')
+      execute("sudo sed -i -e 's/_HOSTNAME_/#{host.hostname}/g' ~/.bashrc")
     end
   end
 
   task :uninstall do
-    on fetch(:instance_name) do
+    on fetch(:deregistered_names), in: :parallel do
       execute('sudo service httpd stop')
     end
   end
 
   task :register do
     client = TargetGroupClient.new(ENV['AWS_TARGET_GROUP'])
-    client.register(fetch(:instance_id) || ENV['INSTANCE_ID'])
+    (fetch(:instance_ids) || [ENV['INSTANCE_ID']]).each do |id|
+      client.register(id)
+    end
   end
 
   task :deregister do
     client = TargetGroupClient.new(ENV['AWS_TARGET_GROUP'])
-    instance_id = ENV['INSTANCE_ID'] || client.deregistrable_instance.id
-    client.deregister(instance_id)
-    set(:deregistered_id, instance_id)
+    deregistered_ids = []
+    if (num = fetch(:instance_ids)&.size)
+      num.times do
+        id = client.deregistrable_instance.id
+        client.deregister(id)
+        deregistered_ids << id
+      end
+    else
+      client.deregister(ENV['INSTANCE_ID'])
+      deregistered_ids << ENV['INSTANCE_ID']
+    end
+    set(:deregistered_ids, deregistered_ids)
+    set(:deregistered_names, deregistered_ids.map { |id| InstanceWrapper.retrieve(id).instance_name })
   end
 
   task :list do
@@ -304,7 +336,7 @@ namespace :ec2 do
   end
 
   %i(launch terminate register deregister).each do |name|
-    task(name) { on(:local) { execute('echo "Finished" >/dev/null') } }
+    task(name) { on(:local) { info('Finished') } }
   end
 end
 
@@ -316,14 +348,10 @@ task :deploy do
     invoke 'ec2:launch'
     invoke 'ec2:install'
     invoke 'ec2:register'
-    invoke 'ec2:deregister'
-    launched_id = fetch(:instance_id)
-    launched_name = fetch(:instance_name)
-    instance = InstanceWrapper.new(EC2Client.new.retrieve(fetch(:deregistered_id)))
-    set(:instance_id, instance.id)
-    set(:instance_name, instance.instance_name)
-    invoke 'ec2:uninstall'
-    invoke 'ec2:terminate'
-    puts "Deploy succeeded: #{launched_name} (#{launched_id})"
+    if ENV['ROTATE']
+      invoke 'ec2:deregister'
+      invoke 'ec2:uninstall'
+      invoke 'ec2:terminate'
+    end
   end
 end
