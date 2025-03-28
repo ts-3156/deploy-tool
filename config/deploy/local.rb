@@ -291,12 +291,18 @@ namespace :ec2 do
   task :install do
     on fetch(:instance_names), in: :parallel do |host|
       execute('sudo rm -rf /var/tmp/aws-mon/*')
+      execute('sudo cp /dev/null /var/log/cron')
       # execute('sudo cp /dev/null /var/log/httpd/access_log')
       # execute('sudo cp /dev/null /var/log/httpd/error_log')
       execute('sudo yum install -y -q httpd')
       execute(%q(sudo sh -c "echo 'hello' >/var/www/html/index.html"))
       execute('sudo service httpd start')
       execute('curl -sS localhost')
+      on :local do
+        execute("rsync ./bin/notify_spot_instance_interruption.rb #{host.hostname}:~/")
+      end
+      execute(%Q(sed -i -e 's#__ARN__##{ENV['AWS_TARGET_GROUP']}#' -e 's#__REGION__##{ENV['AWS_REGION']}#' ~/notify_spot_instance_interruption.rb))
+      execute(%q((crontab -l ; echo '* * * * * /usr/local/bin/ruby ~/notify_spot_instance_interruption.rb') | crontab -))
       execute("sudo sed -i -e 's/_HOSTNAME_/#{host.hostname}/g' ~/.bashrc")
     end
   end
