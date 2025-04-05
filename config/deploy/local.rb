@@ -121,8 +121,9 @@ class EC2Client
   end
 
   def retrieve(id)
-    filters = [{name: 'instance-id', values: [id]}]
-    @ec2.instances(filters: filters).first
+    # @ec2.instances(filters: [{name: 'instance-id', values: [id]}]).first
+    @ec2.instances(instance_ids: [id]).first
+    @ec2.instance(id)
   end
 
   # Not used
