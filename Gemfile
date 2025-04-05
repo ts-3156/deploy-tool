@@ -3,7 +3,8 @@
 source "https://rubygems.org"
 
 gem "dotenv"
-gem "fiddle"
+gem "irb"
+#gem "fiddle"
 gem "capistrano"
 gem "rexml"
 gem "aws-sdk-ec2"
