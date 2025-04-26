@@ -1,0 +1,4 @@
+/log
+/ssh_config
+/.env
+/deploy*.pid
