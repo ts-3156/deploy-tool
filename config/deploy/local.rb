@@ -356,7 +356,7 @@ task :deploy do
     invoke 'ec2:launch'
     invoke 'ec2:install'
     invoke 'ec2:register'
-    if ENV['ROTATE']
+    if %w[1 true].include?(ENV['ROTATE'])
       invoke 'ec2:deregister'
       invoke 'ec2:uninstall'
       invoke 'ec2:terminate'
